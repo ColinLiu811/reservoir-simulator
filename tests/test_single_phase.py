@@ -83,3 +83,54 @@ def test_hydrostatic_column_is_in_equilibrium():
 def test_unknown_face_rejected():
     with pytest.raises(ValueError):
         SinglePhaseSimulator(Grid(nx=3), WATER, 0.0, boundaries={"left": 1.0})
+
+
+def _drawdown_case(n=101, size=2000.0, solver="direct"):
+    from ressim.wells import Well
+
+    g = Grid(nx=n, ny=n, lx=size, ly=size, thickness=10.0, perm=K, poro=0.2)
+    centre = g.cell_at(size / 2, size / 2)
+    q = 1e-3                                         # ~540 bbl/day producer
+    well = Well("P1", centre, "rate", -q, rw=0.1)
+    sim = SinglePhaseSimulator(g, WATER, 2e7, wells=[well], solver=solver)
+    return g, sim, well, q
+
+
+def test_drawdown_matches_line_source_away_from_well():
+    from ressim.wells import line_source_drawdown
+
+    g, sim, well, q = _drawdown_case()
+    t_end = 2e4                      # radius of investigation ~ 4 sqrt(eta t) < half domain
+    sim.run(t_end, dt=10.0, dt_growth=1.15, dt_max=500.0)
+    xc, yc = g.lx / 2, g.ly / 2
+    X, Y = np.meshgrid(g.x, g.y)
+    r = np.hypot(X - xc, Y - yc).ravel()
+    ring = (r > 60) & (r < 300)
+    exact = 2e7 - line_source_drawdown(r[ring], t_end, q, MU, K, 10.0, 0.2, CT)
+    dp_max = 2e7 - exact.min()
+    assert np.abs(sim.p[ring] - exact).max() / dp_max < 0.03
+
+
+def test_peaceman_bhp_matches_line_source_at_wellbore():
+    from ressim.wells import line_source_drawdown
+
+    g, sim, well, q = _drawdown_case()
+    t_end = 2e4
+    res = sim.run(t_end, dt=10.0, dt_growth=1.15, dt_max=500.0)
+    exact_pwf = 2e7 - line_source_drawdown(well.rw, t_end, q, MU, K, 10.0, 0.2, CT)
+    assert res.well_bhp["P1"][-1] == pytest.approx(exact_pwf, rel=2e-3)
+    assert np.allclose(res.well_rate["P1"], -q)
+
+
+def test_bhp_wells_balance_mass():
+    from ressim.wells import Well
+
+    g = Grid(nx=20, ny=20, lx=200.0, ly=200.0, thickness=10.0, perm=K)
+    wells = [Well("I", 0, "bhp", 2.5e7), Well("P", g.n - 1, "bhp", 1.5e7)]
+    sim = SinglePhaseSimulator(g, WATER, 2e7, wells=wells, solver="cg")
+    for _ in range(5):
+        p_old = sim.p.copy()
+        sim.step(50.0)
+        assert sim.material_balance_error(p_old, 50.0) < 1e-6
+    sim.steady_state()
+    assert sim.well_rate(wells[0]) == pytest.approx(-sim.well_rate(wells[1]), rel=1e-8)

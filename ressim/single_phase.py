@@ -19,6 +19,7 @@ import numpy as np
 from .grid import FACES, Grid
 from .linalg import SolveInfo, assemble_laplacian, solve
 from .units import G
+from .wells import Well
 
 
 @dataclass
@@ -40,6 +41,8 @@ class SinglePhaseResult:
     times: np.ndarray
     pressure: np.ndarray                  # (n_times, n_cells)
     boundary_flux: dict = field(default_factory=dict)   # face -> (n_times,) inflow m^3/s
+    well_rate: dict = field(default_factory=dict)       # name -> (n_times,) m^3/s, + = injection
+    well_bhp: dict = field(default_factory=dict)        # name -> (n_times,) Pa
     solver_info: list = field(default_factory=list)
 
 
@@ -53,12 +56,13 @@ class SinglePhaseSimulator:
     p_init : initial pressure, scalar or per-cell [Pa]
     boundaries : ``{face: pressure}`` for constant-pressure faces; faces not
         listed are no-flow
+    wells : list of :class:`~ressim.wells.Well`
     gravity : include the ``rho*g*z`` term (needs a vertical grid)
     solver : linear solver method, see :mod:`ressim.linalg`
     """
 
     def __init__(self, grid: Grid, fluid: SinglePhaseFluid, p_init, boundaries=None,
-                 gravity=False, solver="direct"):
+                 wells: list[Well] = (), gravity=False, solver="direct"):
         self.grid = grid
         self.fluid = fluid
         self.p = np.broadcast_to(np.asarray(p_init, dtype=float), (grid.n,)).copy()
@@ -66,6 +70,8 @@ class SinglePhaseSimulator:
         for face in self.boundaries:
             if face not in FACES:
                 raise ValueError(f"unknown face {face!r}")
+        self.wells = list(wells)
+        self._wi = {w.name: w.index(grid) for w in self.wells}
         self.gravity = gravity
         self.solver = solver
         self.time = 0.0
@@ -99,7 +105,25 @@ class SinglePhaseSimulator:
         return A, rhs
 
     def _well_terms(self, diag, rhs):
-        """Hook for well source terms (none in the base model)."""
+        for w in self.wells:
+            if w.control == "rate":
+                rhs[w.cell] += w.value
+            else:
+                c = self._wi[w.name] / self.fluid.mu
+                diag[w.cell] += c
+                rhs[w.cell] += c * w.value
+
+    def well_rate(self, well: Well) -> float:
+        """Current rate [m^3/s], positive for injection."""
+        if well.control == "rate":
+            return well.value
+        return self._wi[well.name] / self.fluid.mu * (well.value - self.p[well.cell])
+
+    def well_bhp(self, well: Well) -> float:
+        """Current bottom-hole pressure [Pa] from the Peaceman relation."""
+        if well.control == "bhp":
+            return well.value
+        return self.p[well.cell] + well.value * self.fluid.mu / self._wi[well.name]
 
     def step(self, dt) -> SolveInfo:
         """Advance one backward-Euler step of length ``dt`` [s]."""
@@ -130,6 +154,8 @@ class SinglePhaseSimulator:
         """
         times, ps, infos = [self.time], [self.p.copy()], []
         flux = {f: [self.boundary_flux(f)] for f in self.boundaries}
+        rates = {w.name: [self.well_rate(w)] for w in self.wells}
+        bhps = {w.name: [self.well_bhp(w)] for w in self.wells}
         while self.time < t_end * (1 - 1e-12):
             step = min(dt, t_end - self.time)
             infos.append(self.step(step))
@@ -137,24 +163,29 @@ class SinglePhaseSimulator:
             ps.append(self.p.copy())
             for f in flux:
                 flux[f].append(self.boundary_flux(f))
+            for w in self.wells:
+                rates[w.name].append(self.well_rate(w))
+                bhps[w.name].append(self.well_bhp(w))
             dt *= dt_growth
             if dt_max is not None:
                 dt = min(dt, dt_max)
         return SinglePhaseResult(
             times=np.array(times), pressure=np.array(ps),
-            boundary_flux={f: np.array(v) for f, v in flux.items()}, solver_info=infos,
+            boundary_flux={f: np.array(v) for f, v in flux.items()},
+            well_rate={k: np.array(v) for k, v in rates.items()},
+            well_bhp={k: np.array(v) for k, v in bhps.items()},
+            solver_info=infos,
         )
 
     def material_balance_error(self, p_old, dt) -> float:
-        """Relative mismatch between storage change and net inflow over the
-        last step (call right after :meth:`step`)."""
+        """Mismatch between storage change and net inflow over the last step
+        (call right after :meth:`step`), relative to the gross throughput."""
         storage = np.sum(self.grid.pore_volume * self.fluid.ct * (self.p - p_old))
-        inflow = (sum(self.boundary_flux(f) for f in self.boundaries) + self._well_inflow()) * dt
-        scale = max(abs(storage), abs(inflow), 1e-300)
+        flows = [self.boundary_flux(f) for f in self.boundaries]
+        flows += [self.well_rate(w) for w in self.wells]
+        inflow = sum(flows) * dt
+        scale = max(abs(storage), sum(abs(q) for q in flows) * dt, 1e-300)
         return abs(storage - inflow) / scale
-
-    def _well_inflow(self) -> float:
-        return 0.0
 
 
 def diffusivity(k, phi, mu, ct):
