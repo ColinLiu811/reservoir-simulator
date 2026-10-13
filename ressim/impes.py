@@ -12,13 +12,28 @@ IMPES = IMplicit Pressure, Explicit Saturation. Each step:
 
        phi V (S^{n+1} - S^n) / dt = q_w - sum_faces F_w
 
+Capillary pressure (``p_w = p_o - Pc``) and gravity enter through the
+phase potentials
+
+    Phi_w = p_o - Pc - rho_w g z,     Phi_o = p_o - rho_o g z
+
+and each phase is upwinded on its own potential difference (taken from the
+previous pressure in the pressure solve), so counter-current flow from
+buoyancy or imbibition is handled.
+
 The explicit step is only conditionally stable. For the hyperbolic
 Buckley-Leverett part the CFL restriction is
 
     dt <= phi V / (Q_out * max f'(S))
 
-per cell, where ``Q_out`` is the total volumetric outflow of the cell. The
-simulator chooses ``dt`` from this bound times a safety factor ``cfl``.
+per cell, where ``Q_out`` is the volumetric outflow of the cell. Capillary
+pressure adds a parabolic term with diffusivity
+``D = T lam_w lam_o / lam_t |dPc/dS|`` and the explicit-diffusion limit
+``dt <= phi V / sum D``. The simulator combines both,
+
+    dt = cfl * min_i  phi V_i / (Q_out_i max f' + sum_faces D),
+
+and can additionally cap the largest saturation change per step.
 """
 
 from __future__ import annotations
@@ -30,7 +45,8 @@ import numpy as np
 
 from .grid import Grid
 from .linalg import assemble_laplacian, solve
-from .relperm import CoreyRelPerm, TwoPhaseFluid, max_dfw_dsw, mobilities
+from .relperm import CapillaryPressure, CoreyRelPerm, TwoPhaseFluid, max_dfw_dsw, mobilities
+from .units import G
 from .wells import Well
 
 
@@ -39,6 +55,7 @@ class IMPESOptions:
     cfl: float = 0.9               # safety factor on the CFL time step
     dt_fixed: float | None = None  # bypass the CFL control (stability studies)
     dt_max: float | None = None
+    ds_max: float | None = None    # cap on max |dS| per step (useful with gravity)
     solver: str = "direct"
     max_steps: int = 2_000_000
 
@@ -67,20 +84,24 @@ class IMPESSimulator:
     Wells: a rate well with ``value > 0`` injects water; with ``value < 0`` it
     produces at fixed total rate split by the block fractional flow. BHP
     wells inject water if ``p_bhp > p_block`` and produce otherwise. At least
-    one BHP well is needed to fix the pressure level of an incompressible
-    system.
+    one BHP well fixes the pressure level of the incompressible system;
+    without one, net well rates must be zero and the pressure in cell 0 is
+    pinned to its initial value (closed systems, e.g. gravity segregation).
     """
 
     def __init__(self, grid: Grid, fluid: TwoPhaseFluid, relperm: CoreyRelPerm,
-                 sw_init, wells: list[Well], options: IMPESOptions | None = None,
-                 p_init=0.0):
+                 sw_init, wells: list[Well] = (), options: IMPESOptions | None = None,
+                 p_init=0.0, capillary: CapillaryPressure | None = None, gravity=False):
         self.grid = grid
         self.fluid = fluid
         self.rp = relperm
         self.opts = options or IMPESOptions()
         self.wells = list(wells)
-        if not any(w.control == "bhp" for w in self.wells):
-            raise ValueError("incompressible IMPES needs at least one BHP-controlled well")
+        self._pin = not any(w.control == "bhp" for w in self.wells)
+        if self._pin and abs(sum(w.value for w in self.wells)) > 0:
+            raise ValueError("incompressible IMPES without a BHP well needs zero net well rate")
+        self.pc = capillary or CapillaryPressure()
+        self.gravity = gravity
         self._wi = {w.name: w.index(grid) for w in self.wells}
 
         self.sw = np.broadcast_to(np.asarray(sw_init, dtype=float), (grid.n,)).copy()
@@ -91,7 +112,15 @@ class IMPESSimulator:
         self._water0 = float(np.sum(self.pv * self.sw))
 
         self.conn = grid.connections()
+        z = grid.depth
+        self._gdz = G * (z[self.conn.a] - z[self.conn.b]) if gravity else np.zeros(len(self.conn))
+        self._p_ref = float(self.p[0])
         self.fprime_max = max_dfw_dsw(relperm, fluid)
+        self._lam_ref = relperm.kro0 / fluid.mu_o + relperm.krw0 / fluid.mu_w
+        # gravity flux ~ T lam_w lam_o / lam_t * drho g dz: bound its S-derivative
+        s = np.linspace(relperm.swc, 1 - relperm.sor, 2001)
+        lw, lo = mobilities(s, relperm, fluid)
+        self._dgrav_max = float(np.max(np.abs(np.gradient(lw * lo / (lw + lo), s))))
 
         self.cum_water_in = 0.0
         self.cum_water_out = 0.0
@@ -99,21 +128,45 @@ class IMPESSimulator:
         self.linear_iterations = 0
 
     # ----------------------------------------------------------- mobilities
+    def _potential_differences(self, p):
+        """Phase potential drops Phi(a) - Phi(b) across each connection."""
+        a, b = self.conn.a, self.conn.b
+        pc = self.pc(self.sw)
+        dp = p[a] - p[b]
+        dphi_w = dp - (pc[a] - pc[b]) - self.fluid.rho_w * self._gdz
+        dphi_o = dp - self.fluid.rho_o * self._gdz
+        return dphi_w, dphi_o
+
     def _upwind_mobilities(self, p):
-        """Face mobilities taken from the upstream cell of each connection."""
+        """Face mobilities taken from each phase's upstream cell."""
         a, b = self.conn.a, self.conn.b
         lw, lo = mobilities(self.sw, self.rp, self.fluid)
-        up = np.where(p[a] >= p[b], a, b)
-        return lw[up], lo[up]
+        dphi_w, dphi_o = self._potential_differences(p)
+        up_w = np.where(dphi_w >= 0, a, b)
+        up_o = np.where(dphi_o >= 0, a, b)
+        return lw[up_w], lo[up_o]
 
     # -------------------------------------------------------------- pressure
     def solve_pressure(self):
         """Implicit pressure solve with saturations frozen at time level n."""
         n = self.grid.n
         lw_f, lo_f = self._upwind_mobilities(self.p)
-        coef = self.conn.T * (lw_f + lo_f)
+        T = self.conn.T
+        # A face whose upstream cells carry neither phase (e.g. oil over water
+        # at rest) has zero total mobility and can split the matrix into
+        # disconnected blocks; a tiny floor keeps it non-singular without
+        # moving fluid (fluxes use the true mobilities).
+        lt_f = np.maximum(lw_f + lo_f, 1e-9 * self._lam_ref)
+        coef = T * lt_f
         diag = np.zeros(n)
         rhs = np.zeros(n)
+        # capillary and gravity parts of the fluxes are known explicitly
+        pc = self.pc(self.sw)
+        a, b = self.conn.a, self.conn.b
+        extra = T * (lw_f * (pc[a] - pc[b])
+                     + (lw_f * self.fluid.rho_w + lo_f * self.fluid.rho_o) * self._gdz)
+        np.add.at(rhs, a, extra)
+        np.add.at(rhs, b, -extra)
         lw, lo = mobilities(self.sw, self.rp, self.fluid)
         for w in self.wells:
             if w.control == "rate":
@@ -122,6 +175,10 @@ class IMPESSimulator:
                 c = self._wi[w.name] * (lw[w.cell] + lo[w.cell])
                 diag[w.cell] += c
                 rhs[w.cell] += c * w.value
+        if self._pin:
+            big = coef.max() if len(coef) else 1.0
+            diag[0] += big
+            rhs[0] += big * self._p_ref
         A = assemble_laplacian(n, self.conn.a, self.conn.b, coef, diag)
         self.p, info = solve(A, rhs, method=self.opts.solver, x0=self.p)
         self.linear_iterations += info.iterations
@@ -130,11 +187,9 @@ class IMPESSimulator:
     # ---------------------------------------------------------------- fluxes
     def phase_fluxes(self):
         """Water and oil volumetric fluxes [m^3/s] from ``a`` to ``b``."""
-        p = self.p
-        a, b = self.conn.a, self.conn.b
-        lw_f, lo_f = self._upwind_mobilities(p)
-        dp = p[a] - p[b]
-        return self.conn.T * lw_f * dp, self.conn.T * lo_f * dp
+        lw_f, lo_f = self._upwind_mobilities(self.p)
+        dphi_w, dphi_o = self._potential_differences(self.p)
+        return self.conn.T * lw_f * dphi_w, self.conn.T * lo_f * dphi_o
 
     def well_rates(self):
         """Per-well (q_w, q_o) [m^3/s] at the current state, + = injection."""
@@ -156,16 +211,40 @@ class IMPESSimulator:
 
     # ------------------------------------------------------------- time step
     def stable_dt(self, fw_flux, fo_flux, rates):
-        """CFL-limited step for the explicit saturation update."""
-        ft = fw_flux + fo_flux
+        """Step limited by advective CFL and explicit capillary diffusion."""
+        a, b = self.conn.a, self.conn.b
         q_out = np.zeros(self.grid.n)
-        np.add.at(q_out, self.conn.a, np.maximum(ft, 0.0))
-        np.add.at(q_out, self.conn.b, np.maximum(-ft, 0.0))
+        for f in (fw_flux, fo_flux):           # phase-wise: counts counter-current flow
+            np.add.at(q_out, a, np.maximum(f, 0.0))
+            np.add.at(q_out, b, np.maximum(-f, 0.0))
         for w in self.wells:
             qw, qo = rates[w.name]
             q_out[w.cell] += max(-(qw + qo), 0.0)
+        rate = q_out * self.fprime_max
+        if self.gravity:
+            g_face = self.conn.T * np.abs((self.fluid.rho_w - self.fluid.rho_o) * self._gdz) \
+                * self._dgrav_max
+            np.add.at(rate, a, g_face)
+            np.add.at(rate, b, g_face)
+
+        if self.pc.pe > 0:
+            lw, lo = mobilities(self.sw, self.rp, self.fluid)
+            lt = lw + lo
+            lam_eff = np.where(lt > 0, lw * lo / np.where(lt > 0, lt, 1.0), 0.0)
+            # |dPc/dS| as the secant across the face (Pc can be steep or
+            # kinked near Swc), falling back to the cell derivatives
+            pc = self.pc(self.sw)
+            ds = self.sw[a] - self.sw[b]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                secant = np.abs((pc[a] - pc[b]) / ds)
+            dpc = np.abs(self.pc.derivative(self.sw))
+            slope = np.where(np.abs(ds) > 1e-6, secant, np.maximum(dpc[a], dpc[b]))
+            slope = np.maximum(slope, np.maximum(dpc[a], dpc[b]))
+            d_face = self.conn.T * np.maximum(lam_eff[a], lam_eff[b]) * slope
+            np.add.at(rate, a, d_face)
+            np.add.at(rate, b, d_face)
         with np.errstate(divide="ignore"):
-            dt_cells = self.pv / (q_out * self.fprime_max)
+            dt_cells = self.pv / rate
         return self.opts.cfl * float(np.min(dt_cells))
 
     def step(self, dt_limit=None):
@@ -180,19 +259,24 @@ class IMPESSimulator:
             dt = self.stable_dt(fw_flux, fo_flux, rates)
             if self.opts.dt_max is not None:
                 dt = min(dt, self.opts.dt_max)
-        if dt_limit is not None:
-            dt = min(dt, dt_limit)
-        if not np.isfinite(dt) or dt <= 0:
-            raise RuntimeError("no flow in the model: cannot choose a time step")
-
-        # explicit upwind water balance
+        # explicit upwind water balance: dS/dt
         net_out = np.zeros(self.grid.n)
         np.add.at(net_out, self.conn.a, fw_flux)
         np.add.at(net_out, self.conn.b, -fw_flux)
         src = np.zeros(self.grid.n)
         for w in self.wells:
             src[w.cell] += rates[w.name][0]
-        self.sw = self.sw + dt / self.pv * (src - net_out)
+        dsdt = (src - net_out) / self.pv
+
+        if self.opts.ds_max is not None and self.opts.dt_fixed is None:
+            peak = np.abs(dsdt).max()
+            if peak > 0:
+                dt = min(dt, self.opts.ds_max / peak)
+        if dt_limit is not None:
+            dt = min(dt, dt_limit)
+        if not np.isfinite(dt) or dt <= 0:
+            raise RuntimeError("no flow in the model: cannot choose a time step")
+        self.sw = self.sw + dt * dsdt
 
         for w in self.wells:
             qw, qo = rates[w.name]

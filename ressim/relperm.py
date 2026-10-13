@@ -8,7 +8,7 @@ Corey relative permeability:
 
 Brooks-Corey style capillary pressure (zero by default):
 
-    Pc = pe * Se^(-1/lambda), capped at ``pc_max``
+    Pc = pe * Se^(-1/lambda), capped at ``pc_max`` (default 10 pe)
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class CapillaryPressure:
 
     pe: float = 0.0          # entry pressure [Pa]
     lam: float = 2.0         # pore-size distribution index
-    pc_max: float = 1e7      # cap as Se -> 0 [Pa]
+    pc_max: float | None = None   # cap as Se -> 0 [Pa]; None = 10 * pe
     swc: float = 0.2
     sor: float = 0.2
 
@@ -72,7 +72,8 @@ class CapillaryPressure:
     def __call__(self, sw):
         if self.pe == 0.0:
             return np.zeros_like(np.asarray(sw, dtype=float))
-        return np.minimum(self.pe * self.se(sw) ** (-1.0 / self.lam), self.pc_max)
+        cap = 10.0 * self.pe if self.pc_max is None else self.pc_max
+        return np.minimum(self.pe * self.se(sw) ** (-1.0 / self.lam), cap)
 
     def derivative(self, sw, h=1e-6):
         """dPc/dSw by central difference (<= 0)."""
